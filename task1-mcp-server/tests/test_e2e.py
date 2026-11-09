@@ -17,15 +17,47 @@ from collections.abc import Iterator
 import pytest
 
 PYTHON = sys.executable
+SERVER_ARGV = [PYTHON, "-m", "customer_mcp"]
+
+
+class WireViolation(AssertionError):
+    """Something other than a JSON-RPC 2.0 message appeared on server stdout."""
+
+
+def parse_wire_line(line: str) -> dict:
+    """Strictly parse one line of server stdout.
+
+    Every line on the wire must be a JSON object with jsonrpc == "2.0".
+    Nothing is skipped or filtered: blank lines, whitespace-only lines and
+    non-JSON text all raise WireViolation.
+    """
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise WireViolation(f"non-JSON line on stdout: {line!r}") from exc
+    if not isinstance(obj, dict) or obj.get("jsonrpc") != "2.0":
+        raise WireViolation(f"stdout line is not a JSON-RPC 2.0 message: {line!r}")
+    return obj
+
+
+def parse_wire(text: str) -> list[dict]:
+    """Strictly parse a chunk of stdout (e.g. everything read after EOF)."""
+    if text and not text.endswith("\n"):
+        raise WireViolation(f"stdout does not end with a newline: {text[-80:]!r}")
+    return [parse_wire_line(line) for line in text.splitlines()]
 
 
 class ServerProcess:
     """Thin wrapper over a `python -m customer_mcp` subprocess: send a JSON
-    object as one NDJSON line, read one NDJSON line back as a JSON object."""
+    object as one NDJSON line, read one NDJSON line back as a JSON object.
 
-    def __init__(self) -> None:
+    Every stdout line read -- by recv() and by close() -- goes through
+    parse_wire_line(), so any stray byte on stdout fails whichever test
+    caused it."""
+
+    def __init__(self, argv: list[str] | None = None) -> None:
         self.proc = subprocess.Popen(
-            [PYTHON, "-m", "customer_mcp"],
+            argv or SERVER_ARGV,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -56,7 +88,7 @@ class ServerProcess:
             stderr = self.proc.stderr.read() if self.proc.stderr else ""
             raise RuntimeError(f"server closed stdout unexpectedly. stderr:\n{stderr}")
         self.stdout_lines.append(line)
-        return json.loads(line)
+        return parse_wire_line(line)
 
     def request(self, method: str, params: dict | None = None) -> dict:
         req_id = self._id()
@@ -90,7 +122,9 @@ class ServerProcess:
         return resp
 
     def close(self) -> tuple[str, str]:
-        """Terminate and return (remaining_stdout, stderr)."""
+        """Close stdin, wait for exit, read stdout and stderr to EOF, and
+        strictly validate the remaining stdout. Returns (remaining_stdout,
+        stderr)."""
         assert self.proc.stdin is not None
         try:
             self.proc.stdin.close()
@@ -103,6 +137,8 @@ class ServerProcess:
             self.proc.wait(timeout=5)
         stdout_rest = self.proc.stdout.read() if self.proc.stdout else ""
         stderr_all = self.proc.stderr.read() if self.proc.stderr else ""
+        self.stderr = stderr_all
+        parse_wire(stdout_rest)  # trailing pollution fails the test too
         return stdout_rest, stderr_all
 
 
@@ -304,22 +340,110 @@ def test_trigger_refund_nonexistent_customer(server: ServerProcess) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_stdout_is_pure_jsonrpc_and_stderr_has_logs() -> None:
+def _full_session() -> tuple[ServerProcess, str, str]:
+    """Drive one complete session covering every stdout-producing path, then
+    close stdin, wait for exit and read both pipes to EOF.
+
+    Each request waits for its response before the next is sent (and before
+    stdin is closed), so the expected response count is deterministic."""
     s = ServerProcess()
-    s.initialize()
-    s.request("tools/list")
-    s.call_tool("get_customer_record", {"customer_id": VALID_CUSTOMER_ID})
-    s.call_tool("get_customer_record", {"customer_id": "not-even-close"})  # triggers a log line
+    s.initialize()  # 1 response; notifications/initialized gets none
+    assert "result" in s.request("tools/list")  # 2
+    ok = s.call_tool("get_customer_record", {"customer_id": VALID_CUSTOMER_ID})  # 3
+    assert "result" in ok and ok["result"].get("isError") is not True, ok
+    refund = s.call_tool(
+        "trigger_refund",
+        {"customer_id": VALID_CUSTOMER_ID, "amount": 1.00, "reason": "Purity test refund"},
+    )  # 4
+    assert "result" in refund and refund["result"].get("isError") is not True, refund
+    bad = s.call_tool("get_customer_record", {"customer_id": "not-even-close"})  # 5
+    assert bad["error"]["code"] == -32602, bad
+    unknown = s.call_tool("not_a_real_tool", {})  # 6
+    assert "error" in unknown, unknown
     stdout_rest, stderr_all = s.close()
+    return s, stdout_rest, stderr_all
+
+
+EXPECTED_SESSION_RESPONSES = 6
+
+
+def test_stdout_is_pure_jsonrpc() -> None:
+    s, stdout_rest, _ = _full_session()
+    assert s.proc.returncode == 0, f"server exited with {s.proc.returncode}"
 
     all_stdout = "".join(s.stdout_lines) + stdout_rest
-    for line in all_stdout.splitlines():
-        if not line.strip():
-            continue
-        obj = json.loads(line)  # fails the test if any line isn't valid JSON
-        assert obj.get("jsonrpc") == "2.0"
+    messages = parse_wire(all_stdout)  # raises on any non-JSON-RPC byte
+    assert len(messages) == EXPECTED_SESSION_RESPONSES, (
+        f"expected exactly {EXPECTED_SESSION_RESPONSES} lines on stdout, got "
+        f"{len(messages)}:\n{all_stdout}"
+    )
+    assert stdout_rest == "", f"unexpected extra stdout after last response: {stdout_rest!r}"
+    assert [m.get("id") for m in messages] == list(range(1, EXPECTED_SESSION_RESPONSES + 1))
 
+
+def test_stderr_has_logs_and_no_jsonrpc_responses() -> None:
+    _, _, stderr_all = _full_session()
     assert stderr_all.strip() != "", "expected log output on stderr"
+    for line in stderr_all.splitlines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # ordinary log text: exactly what stderr is for
+        is_response = isinstance(obj, dict) and obj.get("jsonrpc") == "2.0" and (
+            "result" in obj or "error" in obj
+        )
+        assert not is_response, f"JSON-RPC response leaked onto stderr: {line!r}"
+
+
+def test_harness_detects_stdout_pollution() -> None:
+    """Control: prove the reader is not blind. Launch the real server via a
+    wrapper that writes one junk line to fd 1 *before* the server starts
+    (outside the SDK's fd-1 diversion window), and require that the first
+    read fails."""
+    wrapper = (
+        "import os, runpy; os.write(1, b'junk\\n'); "
+        "runpy.run_module('customer_mcp', run_name='__main__', alter_sys=True)"
+    )
+    s = ServerProcess([PYTHON, "-c", wrapper])
+    try:
+        with pytest.raises(WireViolation, match="junk"):
+            s.initialize()
+    finally:
+        s.proc.kill()
+        s.proc.wait(timeout=5)
+
+
+SDK_GUARD_PROBE = """
+import os, sys, anyio
+from mcp.server.stdio import stdio_server
+
+async def main():
+    async with stdio_server() as (_read, write):
+        sys.stdout.write("SYS_STDOUT_MARKER\\n"); sys.stdout.flush()
+        os.write(1, b"FD1_MARKER\\n")
+        await write.aclose()
+    os.write(1, b"AFTER_RESTORE\\n")
+
+anyio.run(main)
+"""
+
+
+def test_sdk_stdio_server_diverts_fd1_to_stderr() -> None:
+    """Pin the SDK behaviour this server relies on: while `stdio_server()` is
+    serving, fd 1 is dup2'd onto stderr, so handler-level sys.stdout.write /
+    os.write(1, ...) can't reach the wire. If an SDK upgrade drops this, this
+    test fails and the README's mutation-check table needs revisiting."""
+    proc = subprocess.run(
+        [PYTHON, "-c", SDK_GUARD_PROBE],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "AFTER_RESTORE\n", proc.stdout
+    assert "SYS_STDOUT_MARKER" in proc.stderr
+    assert "FD1_MARKER" in proc.stderr
 
 
 # ---------------------------------------------------------------------------

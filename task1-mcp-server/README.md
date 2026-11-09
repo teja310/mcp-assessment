@@ -56,9 +56,11 @@ uv pip install -e ".[dev]"
 python -m pytest tests/test_e2e.py -v
 ```
 
-All 33 tests spawn the server as a real subprocess and talk raw NDJSON
-over its stdin/stdout — no SDK client involved — so what's asserted is
-exactly what a client on the wire would see.
+All 36 tests spawn a real subprocess and talk raw NDJSON over its
+stdin/stdout — no SDK client involved — so what's asserted is exactly
+what a client on the wire would see. The shared reader
+(`parse_wire_line`) rejects any stdout line that isn't a JSON object with
+`"jsonrpc": "2.0"`, including blank lines; nothing is skipped or filtered.
 
 ## Tool contracts
 
@@ -211,10 +213,43 @@ project module is imported: `logging.basicConfig(stream=sys.stderr, ...)`,
 a `print()` → stderr shim, a `sys.excepthook`, and an asyncio loop
 exception handler. `SIGINT`/`SIGTERM` trigger a clean shutdown via
 `asyncio.Event` rather than an abrupt `KeyboardInterrupt`. EOF on stdin is
-treated as a normal shutdown, not an error. `tests/test_e2e.py`'s
-`test_stdout_is_pure_jsonrpc_and_stderr_has_logs` proves — by actually
-running the server and parsing every stdout line as JSON — that nothing
-but JSON-RPC ever reaches stdout, and that stderr does carry log output.
+treated as a normal shutdown, not an error.
+
+There is also a second, stronger layer that comes from the SDK, not from
+this project: `mcp==2.3.0`'s `stdio_server()`
+(`mcp/server/stdio.py`, `_claim_fd`) moves the real stdout pipe to a
+private fd ≥ 3 and `dup2`s **fd 1 onto stderr** for as long as it is
+serving. So `sys.stdout.write(...)` and even `os.write(1, ...)` inside a
+handler land on stderr, not the wire. The window does **not** cover code
+that runs before `stdio_server()` is entered (module import, `build_server`).
+
+`test_stdout_is_pure_jsonrpc` runs a full session (initialize,
+`notifications/initialized`, `tools/list`, a successful call to each tool,
+a `-32602` error and an unknown tool), closes stdin, reads stdout to EOF
+and requires exactly 6 valid JSON-RPC lines. `test_stderr_has_logs_and_no_jsonrpc_responses`
+checks the other direction. `test_harness_detects_stdout_pollution` is a
+control proving the reader really fails on junk, and
+`test_sdk_stdio_server_diverts_fd1_to_stderr` pins the SDK behaviour
+above so an upgrade that drops it is noticed.
+
+### Stdout safety verification
+
+Mutation checks (apply to `src/customer_mcp/server.py`, run
+`python -m pytest tests/test_e2e.py -q`, then
+`git checkout -- src/customer_mcp/server.py`):
+
+| # | Mutation | Result | Why |
+|---|----------|--------|-----|
+| M1 | `print("debug")` first line of `handle_call_tool` | passes | `print` shim defaults to stderr (and fd 1 is diverted anyway) |
+| M2 | `sys.stdout.write("debug\n"); sys.stdout.flush()` top of `handle_list_tools` | passes | SDK has fd 1 → stderr while serving; `debug` appears on stderr |
+| M3 | same, top of `handle_call_tool` | passes | same as M2 |
+| M4 | `os.write(1, b"debug\n")` top of `handle_call_tool` | passes | deliberate fd-level guard in the SDK (`dup2`) |
+| M5 | `sys.stdout.write("debug\n")` at module import in `server.py` | **fails** (`WireViolation`) | runs before `stdio_server()` diverts fd 1, so it hits the wire |
+
+M1–M4 passing is correct: the bytes never reach stdout (verified by
+capturing the server's stdout and stderr separately). M5 and
+`test_harness_detects_stdout_pollution` show the suite does fail when
+pollution actually reaches the wire.
 
 ### Store concurrency
 
