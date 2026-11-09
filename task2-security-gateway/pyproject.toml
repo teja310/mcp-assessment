@@ -1,0 +1,29 @@
+[project]
+name = "mcp-gateway"
+version = "0.1.0"
+description = "MCP security gateway: HTTP JSON-RPC reverse proxy with bearer-token role auth and admin_ tool filtering."
+requires-python = ">=3.12"
+dependencies = [
+    "starlette==1.10.0",
+    "httpx==0.28.1",
+    "uvicorn==0.54.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.2.0",
+    "pytest-asyncio==1.4.1.post1",
+    "mcp==2.3.0",  # official SDK, used only by the real-client smoke test
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
