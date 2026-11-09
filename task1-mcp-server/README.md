@@ -33,15 +33,21 @@ session (one request per line on stdin, one response per line on stdout):
 {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{...json customer record...}"}],"isError":false}}
 ```
 
-**Important for scripted/piped use:** a well-behaved client reads each
-response before sending the next request, or at least before closing
-stdin. This SDK (see "SDK version" below) cancels any request whose
-response hasn't been written yet as soon as stdin reaches EOF — so a
-shell pipeline that blasts several requests at once and closes stdin
-immediately can lose the last response. This is a transport-teardown
-characteristic of the installed SDK, not a bug in this server; the test
-suite and any normal MCP client (which always waits for a reply before
-proceeding) never hit it.
+**Piped use is safe:** a client may write all its requests and close
+stdin straight away; every request already received is still answered
+before the server exits.
+
+The SDK (mcp 2.3.0, `JSONRPCDispatcher.run`) cancels in-flight handlers
+the moment stdin reaches EOF. That's right for HTTP, where EOF means the
+caller is gone, but over stdio it's a half-close. In the first version,
+`printf '<init>\n<initialized>\n<list>\n<call>\n' | python -m customer_mcp`
+lost the last reply in 20 of 20 runs. `stdio_drain.py` sits between the
+transport and the server: it tracks request ids and holds back EOF until
+each has a response written, or was cancelled via `notifications/cancelled`.
+A 30s cap ensures a hung handler can't keep the process alive forever.
+Now 20 of 20 runs return every reply, and
+`test_all_requests_answered_when_stdin_closes_immediately` sends 50 calls
+and closes stdin at once.
 
 ### Registering with Claude Code
 
@@ -53,12 +59,20 @@ claude mcp add customer-server -- /absolute/path/to/mcp-task1/.venv/bin/python -
 
 ```bash
 uv pip install -e ".[dev]"
-python -m pytest tests/test_e2e.py -v
+python -m pytest -v    # 41 passed
 ```
 
-All 36 tests spawn a real subprocess and talk raw NDJSON over its
-stdin/stdout — no SDK client involved — so what's asserted is exactly
-what a client on the wire would see. The shared reader
+- `tests/test_e2e.py` (37 tests) spawns a real subprocess and talks raw
+  NDJSON over its stdin/stdout, with no SDK client involved, so what's
+  asserted is exactly what a client on the wire would see.
+- `tests/test_sdk_client.py` drives the server with the **official MCP SDK
+  client** (`stdio_client` + `ClientSession`): handshake, `tools/list`, both
+  tools, a business miss, and both error cases arriving as `MCPError(-32602)`.
+- `tests/test_stdio_drain.py` unit-tests EOF draining: slow replies are
+  awaited, a hung request is cut off at the drain timeout, and a cancelled
+  request doesn't hold shutdown.
+
+The shared reader
 (`parse_wire_line`) rejects any stdout line that isn't a JSON object with
 `"jsonrpc": "2.0"`, including blank lines; nothing is skipped or filtered.
 
@@ -104,17 +118,19 @@ logic — each call is a new refund attempt).
 | Situation | Channel | Code |
 |---|---|---|
 | Malformed/invalid tool arguments (wrong type, bad pattern, missing field, extra field, out of range, etc.) | JSON-RPC `error` | `-32602` `INVALID_PARAMS` |
-| Unknown tool name | JSON-RPC `error` | `-32601` `METHOD_NOT_FOUND` (see note below) |
+| Unknown tool name | JSON-RPC `error` | `-32602` `INVALID_PARAMS`, message `Unknown tool: <name>` (see note below) |
 | Unexpected/unhandled exception inside a tool handler | JSON-RPC `error` | `-32603` `INTERNAL_ERROR` (generic message; full traceback logged to stderr only) |
 | Customer not found | Normal result, `isError: true` | — (business-level miss, not a protocol error) |
 | Refund amount exceeds refundable balance | Normal result, `isError: true` | — (business-level miss) |
 
-**Unknown-tool-name policy:** this server returns `METHOD_NOT_FOUND`
-(-32601) rather than `INVALID_PARAMS` (-32602). Rationale: a tool name is
-analogous to a JSON-RPC *method* — "I don't support this operation at
-all" is squarely what -32601 means, whereas -32602 is reserved here for a
-*recognized* tool called with bad arguments. (Both are defensible; this
-is the documented pick, per the task's instruction to choose one.)
+**Unknown-tool-name policy:** this server returns `INVALID_PARAMS`
+(-32602) with message `Unknown tool: <name>`, matching the MCP spec. The
+[tools page](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
+lists unknown tools under protocol errors, and its example error is exactly
+`{"code": -32602, "message": "Unknown tool: invalid_tool_name"}`. The JSON-RPC
+method (`tools/call`) exists; the `name` *parameter* is what's invalid, so
+`METHOD_NOT_FOUND` (-32601) would misdescribe the error. (An earlier
+version used -32601; it was changed to follow the spec.)
 
 ## Design decisions
 
@@ -269,8 +285,11 @@ src/customer_mcp/
     schemas.py            # Pydantic v2 input models (shared validation + JSON Schema source)
     store.py               # in-memory mock store + asyncio.Lock
     server.py             # Server construction, on_list_tools/on_call_tool handlers
+    stdio_drain.py        # answer in-flight requests before shutting down on stdin EOF
 tests/
     test_e2e.py           # subprocess + raw NDJSON-over-stdio e2e tests
+    test_sdk_client.py    # official MCP SDK client smoke test
+    test_stdio_drain.py   # EOF-drain unit tests
 ```
 
 ## Assumptions / trade-offs

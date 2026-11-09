@@ -300,7 +300,8 @@ def test_get_customer_record_extra_unknown_field(server: ServerProcess) -> None:
 def test_unknown_tool_name(server: ServerProcess) -> None:
     resp = server.call_tool("not_a_real_tool", {})
     assert "error" in resp, resp
-    assert resp["error"]["code"] == -32601  # METHOD_NOT_FOUND, documented in README
+    # Per the MCP spec's tools/call example: -32602 "Unknown tool: <name>".
+    assert resp["error"] == {"code": -32602, "message": "Unknown tool: not_a_real_tool"}
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +445,34 @@ def test_sdk_stdio_server_diverts_fd1_to_stderr() -> None:
     assert proc.stdout == "AFTER_RESTORE\n", proc.stdout
     assert "SYS_STDOUT_MARKER" in proc.stderr
     assert "FD1_MARKER" in proc.stderr
+
+
+def test_all_requests_answered_when_stdin_closes_immediately() -> None:
+    """Write a burst of requests and close stdin at once, without waiting for
+    any replies (a half-close). Every request must still get its response.
+    Before stdio_drain, the SDK cancelled in-flight handlers at EOF and the
+    tail of the burst was lost (20/20 runs dropped a reply)."""
+    n_calls = 50
+    lines = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": {"name": "burst", "version": "0"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    ]
+    for i in range(n_calls):
+        lines.append({"jsonrpc": "2.0", "id": 100 + i, "method": "tools/call",
+                      "params": {"name": "get_customer_record", "arguments": {"customer_id": VALID_CUSTOMER_ID}}})
+    proc = subprocess.run(
+        SERVER_ARGV,
+        input="".join(json.dumps(m) + "\n" for m in lines),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    messages = parse_wire(proc.stdout)
+    assert sorted(m["id"] for m in messages) == [1, *range(100, 100 + n_calls)]
+    assert all("result" in m for m in messages)
 
 
 # ---------------------------------------------------------------------------

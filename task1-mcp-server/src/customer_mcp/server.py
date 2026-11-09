@@ -57,6 +57,7 @@ from pydantic import ValidationError
 
 from customer_mcp.logging_setup import log_traceback
 from customer_mcp.schemas import GetCustomerRecordInput, TriggerRefundInput
+from customer_mcp.stdio_drain import serve_draining
 from customer_mcp.store import CustomerNotFoundError, CustomerStore, RefundExceedsBalanceError
 
 logger = logging.getLogger("customer_mcp.server")
@@ -64,13 +65,13 @@ logger = logging.getLogger("customer_mcp.server")
 GET_CUSTOMER_RECORD = "get_customer_record"
 TRIGGER_REFUND = "trigger_refund"
 
-# Unknown-tool-name policy (the task asks us to pick one and document it):
-# METHOD_NOT_FOUND (-32601). A tool name is dispatched the same way a JSON-RPC
-# *method* would be in a simpler protocol -- an unrecognized one means "this
-# server doesn't support that operation at all", which is squarely what
-# -32601 means, whereas INVALID_PARAMS (-32602) is reserved below for a
-# *recognized* tool called with bad arguments.
-UNKNOWN_TOOL_ERROR_CODE = types.METHOD_NOT_FOUND
+# Unknown-tool-name policy: INVALID_PARAMS (-32602), matching the MCP spec.
+# The spec's tools page (2025-06-18, "Error Handling") lists unknown tools
+# under protocol errors, and its example is exactly
+#   {"code": -32602, "message": "Unknown tool: invalid_tool_name"}.
+# The method here is `tools/call`, which does exist; what's wrong is the
+# `name` parameter, so -32601 METHOD_NOT_FOUND would misdescribe it.
+UNKNOWN_TOOL_ERROR_CODE = types.INVALID_PARAMS
 
 
 def _text_result(payload: str) -> types.CallToolResult:
@@ -114,10 +115,10 @@ def build_server(store: CustomerStore) -> Server[None]:
             if name == TRIGGER_REFUND:
                 return await _call_trigger_refund(store, arguments)
             # Unknown tool name: a real JSON-RPC error, not a result.
-            raise MCPError(code=UNKNOWN_TOOL_ERROR_CODE, message=f"Unknown tool: {name!r}")
+            raise MCPError(code=UNKNOWN_TOOL_ERROR_CODE, message=f"Unknown tool: {name}")
         except MCPError:
-            # Already the right wire shape (INVALID_PARAMS / METHOD_NOT_FOUND
-            # below) -- let it propagate untouched. Do NOT catch this into a
+            # Already the right wire shape (INVALID_PARAMS) -- let it
+            # propagate untouched. Do NOT catch this into a
             # CallToolResult; that is exactly the pitfall this server avoids.
             raise
         except Exception as exc:  # noqa: BLE001 - deliberate catch-all boundary
@@ -176,11 +177,11 @@ def _validation_message(exc: ValidationError) -> str:
 
 async def run_stdio(server: Server[None]) -> None:
     """Serve `server` over stdio until stdin closes (EOF) or the process is
-    asked to stop. EOF is a normal shutdown -- `stdio_server()`'s context
-    manager simply exits -- not an error."""
+    asked to stop. EOF is a normal shutdown, not an error. Requests already
+    received when stdin closes are still answered first (see stdio_drain)."""
+
+    async def run_server(read_stream, write_stream) -> None:
+        await server.run(read_stream, write_stream, server.create_initialization_options())
+
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
-        )
+        await serve_draining(run_server, read_stream, write_stream)
