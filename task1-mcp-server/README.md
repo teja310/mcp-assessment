@@ -55,6 +55,37 @@ and closes stdin at once.
 claude mcp add customer-server -- /absolute/path/to/mcp-task1/.venv/bin/python -m customer_mcp
 ```
 
+### Registering with Claude Desktop (or any client using `mcpServers` JSON)
+
+Add this to `claude_desktop_config.json` (macOS:
+`~/Library/Application Support/Claude/claude_desktop_config.json`,
+Windows: `%APPDATA%\Claude\claude_desktop_config.json`), then restart
+Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "customer-server": {
+      "command": "/absolute/path/to/mcp-task1/.venv/bin/python",
+      "args": ["-m", "customer_mcp"]
+    }
+  }
+}
+```
+
+Use the venv's Python by absolute path. Desktop apps don't inherit your
+shell's `PATH` or activated venv, so a bare `python` usually resolves to a
+system Python without the dependencies. The two tools then appear under
+the tools menu. Server logs go to stderr, which Claude Desktop writes to
+`~/Library/Logs/Claude/mcp-server-customer-server.log` on macOS.
+
+## Demo and CI
+
+`scripts/demo.sh` starts everything it needs on localhost, runs a short
+scripted demonstration, and cleans up after itself.
+`.github/workflows/tests.yml` runs the test suite and the demo on Ubuntu
+and macOS with Python 3.12.
+
 ## Running the tests
 
 ```bash
