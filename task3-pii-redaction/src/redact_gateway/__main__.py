@@ -3,6 +3,10 @@
 Environment:
   LLM_UPSTREAM_BASE_URL   provider base URL (default http://127.0.0.1:9100/v1, the mock)
   LLM_UPSTREAM_API_KEY    provider API key (optional; sent as Bearer)
+  ANTHROPIC_UPSTREAM_BASE_URL   base URL for /v1/messages (default: LLM_UPSTREAM_BASE_URL)
+  ANTHROPIC_UPSTREAM_API_KEY    Anthropic key (optional; sent as x-api-key)
+  GATEWAY_API_KEYS        comma-separated keys clients must present
+                          (Bearer or x-api-key); unset = no client auth
   GATEWAY_HOST / GATEWAY_PORT   listen address (default 127.0.0.1:8081)
 
 Any of these may also be put in a .env file in the working directory
@@ -25,9 +29,16 @@ def main() -> int:
     # Values from ./.env fill in anything not already set in the real environment.
     load_dotenv(".env", override=False)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    api_keys = [k.strip() for k in os.environ.get("GATEWAY_API_KEYS", "").split(",") if k.strip()]
+    if not api_keys:
+        logging.getLogger("redact_gateway").warning(
+            "GATEWAY_API_KEYS is not set: the gateway accepts unauthenticated requests")
     app = create_app(
         os.environ.get("LLM_UPSTREAM_BASE_URL", "http://127.0.0.1:9100/v1"),
         os.environ.get("LLM_UPSTREAM_API_KEY"),
+        anthropic_base_url=os.environ.get("ANTHROPIC_UPSTREAM_BASE_URL") or None,
+        anthropic_api_key=os.environ.get("ANTHROPIC_UPSTREAM_API_KEY") or None,
+        api_keys=api_keys,
     )
     uvicorn.run(app, host=os.environ.get("GATEWAY_HOST", "127.0.0.1"),
                 port=int(os.environ.get("GATEWAY_PORT", "8081")), log_level="info")
