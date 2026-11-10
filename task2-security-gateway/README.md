@@ -127,7 +127,7 @@ Hiding is cosmetic: the call policy still denies a viewer who knows the name.
 
 `scripts/demo.sh` starts everything it needs on localhost, runs a short
 scripted demonstration, and cleans up after itself.
-`.github/workflows/tests.yml` runs the test suite and the demo on Ubuntu
+The repository-level `.github/workflows/tests.yml` runs this suite and the demo on Ubuntu
 and macOS with Python 3.12.
 
 ## Tests

@@ -128,7 +128,7 @@ about 2 µs per delta, at most 20 characters held, 17 KiB peak allocation.
 `scripts/demo.sh` starts everything it needs on localhost, runs a short
 scripted demonstration, and cleans up after itself. It always uses the bundled mock
 provider, even when `.env` points at a real one.
-`.github/workflows/tests.yml` runs the test suite and the demo on Ubuntu
+The repository-level `.github/workflows/tests.yml` runs this suite and the demo on Ubuntu
 and macOS with Python 3.12.
 
 ## Tests

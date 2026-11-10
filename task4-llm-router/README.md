@@ -172,7 +172,7 @@ unexpected exception returns the standard 500 payload.
 `scripts/demo.sh` starts everything it needs on localhost, runs a short
 scripted demonstration, and cleans up after itself. It always uses the bundled mock
 providers, even when `.env` points at real ones.
-`.github/workflows/tests.yml` runs the test suite and the demo on Ubuntu
+The repository-level `.github/workflows/tests.yml` runs this suite and the demo on Ubuntu
 and macOS with Python 3.12.
 
 ## Tests

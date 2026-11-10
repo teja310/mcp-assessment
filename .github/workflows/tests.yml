@@ -6,11 +6,16 @@ on:
 
 jobs:
   test:
+    name: ${{ matrix.task }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        task: [task1-mcp-server, task2-security-gateway, task3-pii-redaction, task4-llm-router]
+    defaults:
+      run:
+        working-directory: ${{ matrix.task }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
