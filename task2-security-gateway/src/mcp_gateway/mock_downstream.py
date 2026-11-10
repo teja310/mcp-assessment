@@ -68,10 +68,17 @@ def create_mock_app() -> Starlette:
             result = {"content": [{"type": "text", "text": text}], "isError": False}
         else:
             return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "Method not found"}})
+        if request.app.state.sse and "text/event-stream" in request.headers.get("accept", ""):
+            # Streamable HTTP servers may answer a POST with an SSE stream.
+            sse = ('event: message\nid: 1\ndata: {"jsonrpc":"2.0","method":"notifications/progress",'
+                   '"params":{"progressToken":"t","progress":1}}\n\n'
+                   "event: message\nid: 2\ndata: " + json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}) + "\n\n")
+            return Response(sse, media_type="text/event-stream", headers={"mcp-session-id": "mock-session"})
         return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": result}, headers={"mcp-session-id": "mock-session"})
 
     app = Starlette(routes=[Route("/mcp", mcp, methods=["POST", "GET", "DELETE"])])
     app.state.received = received
+    app.state.sse = False  # answer POSTs as SSE when the client accepts it
     return app
 
 

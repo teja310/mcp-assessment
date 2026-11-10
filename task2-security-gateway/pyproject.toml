@@ -7,6 +7,8 @@ dependencies = [
     "starlette==1.10.0",
     "httpx==0.28.1",
     "uvicorn==0.54.0",
+    "pyjwt[crypto]==2.10.1",
+    "python-dotenv==1.1.0",
 ]
 
 [project.optional-dependencies]

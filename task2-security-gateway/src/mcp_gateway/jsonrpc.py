@@ -29,6 +29,7 @@ INTERNAL_ERROR = -32603
 # Implementation-defined server errors (-32000..-32099).
 UNAUTHORIZED = -32001  # required by the task spec: "Unauthorized Tool Call"
 DOWNSTREAM_UNAVAILABLE = -32002
+UNAUTHENTICATED = -32003  # missing/invalid credentials (HTTP 401); distinct from -32001
 
 _MISSING = object()
 

@@ -138,5 +138,53 @@ async def test_bad_token_rejected_before_downstream(stack: dict[str, Any]) -> No
     err = exc_info.value
     while isinstance(err, BaseExceptionGroup):  # unwrap the SDK's task-group wrapping
         err = err.exceptions[0]
-    assert isinstance(err, MCPError) and "missing or invalid bearer token" in str(err)
+    assert isinstance(err, MCPError) and err.code == -32003 and "missing or invalid bearer token" in str(err)
     assert stack["downstream"].requests == []
+
+
+# --- signed JWTs + tools/list filtering, with the official client and server -------
+
+import time as _time  # noqa: E402
+
+import jwt as _jwt  # noqa: E402
+
+from mcp_gateway.auth import JwtVerifier, MultiAuthenticator  # noqa: E402
+
+_SECRET = "k" * 40
+
+
+def _jwt_for(role: str) -> str:
+    now = int(_time.time())
+    return _jwt.encode({"sub": f"{role}-user", "role": role, "aud": "mcp-gateway", "iat": now, "exp": now + 300},
+                       _SECRET, algorithm="HS256")
+
+
+@pytest.fixture
+async def jwt_stack() -> AsyncIterator[dict[str, Any]]:
+    tool_calls: list[str] = []
+    downstream = RecordHTTP(build_downstream(tool_calls).streamable_http_app(host="127.0.0.1"))
+    d_port, g_port = _free_port(), _free_port()
+    auth = MultiAuthenticator([TokenStore({VIEWER: "viewer"}), JwtVerifier(secret=_SECRET, audience="mcp-gateway")])
+    servers = [await _serve(downstream, d_port)]
+    servers.append(await _serve(create_app(f"http://127.0.0.1:{d_port}/mcp", auth, filter_tools_list=True), g_port))
+    try:
+        yield {"url": f"http://127.0.0.1:{g_port}/mcp", "tool_calls": tool_calls}
+    finally:
+        for server, task in reversed(servers):
+            server.should_exit = True
+            await task
+
+
+async def test_official_client_with_jwt_and_filtered_tool_list(jwt_stack: dict[str, Any]) -> None:
+    async for s in _session(jwt_stack["url"], _jwt_for("viewer")):
+        assert {t.name for t in (await s.list_tools()).tools} == {"get_weather"}  # admin tool hidden
+        with pytest.raises(MCPError) as denied:  # and still denied if called by name
+            await s.call_tool("admin_reset_key", {"x": "k1"})
+        assert denied.value.code == -32001
+    async for s in _session(jwt_stack["url"], _jwt_for("admin")):
+        assert {t.name for t in (await s.list_tools()).tools} == {"get_weather", "admin_reset_key"}
+        res = await s.call_tool("admin_reset_key", {"x": "k1"})
+        assert json.loads(res.content[0].text) == {"ran": "admin_reset_key"}
+    async for s in _session(jwt_stack["url"], VIEWER):  # static tokens still work alongside JWTs
+        assert {t.name for t in (await s.list_tools()).tools} == {"get_weather"}
+    assert jwt_stack["tool_calls"] == ["admin_reset_key"]

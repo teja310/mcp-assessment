@@ -60,7 +60,7 @@ async def test_missing_or_invalid_token_is_401(gw: Harness, token: str | None) -
     r = await gw.post({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, token=token)
     assert r.status_code == 401
     assert r.headers["www-authenticate"].startswith("Bearer")
-    assert r.json()["error"]["code"] == -32001
+    assert r.json()["error"]["code"] == -32003  # Unauthenticated: distinct from -32001 (tool denied)
     assert gw.received == []
 
 
@@ -224,7 +224,7 @@ async def test_delete_session_forwarded(gw: Harness) -> None:
 @pytest.mark.parametrize("method", ["GET", "DELETE"])
 async def test_get_and_delete_require_auth(gw: Harness, method: str) -> None:
     r = await gw.client.request(method, "/mcp", headers={"mcp-session-id": "sess-1"})
-    assert r.status_code == 401 and r.json()["error"]["code"] == -32001
+    assert r.status_code == 401 and r.json()["error"]["code"] == -32003
     assert gw.received == []
 
 
