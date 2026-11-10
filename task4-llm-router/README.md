@@ -9,6 +9,10 @@ A model-routing module for an LLM gateway:
   errors and invalid JSON).
 - **Standardized, sanitized errors:** no upstream bodies, hostnames or stack
   traces ever reach the client.
+- **Streaming** (`"stream": true`) with failover until the first event, and
+  real usage charged from the provider's final usage chunk.
+- **Tenant allowlist** (`ROUTER_API_KEYS`) and a **real tokenizer**
+  (`tiktoken`) for the pre-flight estimate.
 
 ## Running it
 
@@ -28,6 +32,12 @@ file (`cp .env.example .env`; real environment variables win). See
 (`PRIMARY_BASE_URL`, `PRIMARY_API_KEY`, `PRIMARY_MODEL`, `PRIMARY_TIMEOUT_MS`,
 `TOKENS_PER_MINUTE`, `ROUTER_DB_PATH`, …). Any OpenAI-compatible provider
 (e.g. xAI at `https://api.x.ai/v1`) works as primary or secondary.
+
+| Setting | Meaning |
+|---|---|
+| `ROUTER_API_KEYS` | comma-separated tenant keys. Any other key → **401 before the limiter is touched**, so a client can't mint new keys to get fresh budgets. Held as SHA-256 digests, compared in constant time. Unset = any bearer key is a tenant (warning logged at startup) |
+| `TOKENIZER` | `auto` (default: `tiktoken` if installed and loadable, else chars/4 with a warning), `tiktoken` (fail at startup if unavailable), `chars` |
+| `EXTRA_RESERVE_TOKENS` | headroom added to every estimate, for reasoning models (see below) |
 
 ## Rate limiter (`limiter.py`)
 
@@ -97,6 +107,53 @@ in-flight request is cancelled and the connection dropped, so a late primary
 answer can never be used or double-charged. The test suite checks this
 (`completed == 0` long after the deadline).
 
+## Streaming
+
+```
+reserve ─▶ primary: connect + headers + FIRST EVENT within the deadline
+              │ 429 / 5xx / timeout / conn error / garbage first event ─▶ secondary (same rule)
+              ▼ first event arrived: committed to this provider
+           relay events as they arrive ─▶ [DONE] ─▶ commit real usage
+              │ provider breaks mid-stream
+              ▼
+           error event (standard payload), no failover, charge the estimate
+```
+
+- **Failover only before the first byte.** Once the client has received
+  part of an answer, switching provider would splice two different answers
+  together, so a mid-stream failure ends the stream with a standardized
+  `data: {"error": {...}}` event instead.
+- **The deadline covers the first event, not just the headers.** A provider
+  that sends `200` and then stalls is failed over. This is tested over real
+  sockets, because in-process transports buffer whole responses and can't
+  show the difference.
+- **Usage.** The router always sends `stream_options.include_usage` and
+  charges the `total_tokens` from the final chunk. If the client didn't ask
+  for usage, that usage-only chunk (and any `usage` field) is removed, so
+  the client sees what it asked for.
+- **Disconnects.** If the client goes away or the stream breaks, the
+  estimate is charged (the provider has most likely billed already) and the
+  upstream connection is closed. The commit is shielded from cancellation.
+- Mid-stream stalls are bounded by the HTTP client's read timeout (30s).
+
+## Token estimate (`tokens.py`)
+
+Before each call the router reserves prompt tokens (message contents plus
+tool definitions, which providers bill as prompt) + 4 per message +
+`max_tokens`. With `tiktoken` (`o200k_base`) installed, the prompt is
+tokenized. Otherwise it falls back to chars/4, which is low exactly where it
+hurts:
+
+| Text | tiktoken | chars/4 |
+|---|---|---|
+| `你好世界` × 50 | 100 | 50 (CJK: 2× under) |
+| `{"a": [1,2,3]}` × 20 | 200 | 70 (JSON: ~3× under) |
+| `x` × 400 | 50 | 100 (over) |
+
+`o200k_base` is OpenAI's tokenizer. For other providers it's a closer
+approximation, not an exact count. The reservation is corrected to the
+provider's reported usage after every call either way.
+
 **Standard error payload.** Every error is one of the fixed entries in
 `ERRORS`:
 
@@ -110,10 +167,18 @@ Types: `invalid_request` 400, `authentication_error` 401, `request_too_large`
 `request_id` for correlation. The HTTP layer has a catch-all, so even an
 unexpected exception returns the standard 500 payload.
 
+## Demo and CI
+
+`scripts/demo.sh` starts everything it needs on localhost, runs a short
+scripted demonstration, and cleans up after itself. It always uses the bundled mock
+providers, even when `.env` points at real ones.
+`.github/workflows/tests.yml` runs the test suite and the demo on Ubuntu
+and macOS with Python 3.12.
+
 ## Tests
 
 ```bash
-python -m pytest -q    # 38 passed, ~10s (two tests use the real 3000ms deadline)
+python -m pytest -q    # 58 passed, ~14s (some tests use real sockets and the real 3000ms deadline)
 ```
 
 Highlights:
@@ -142,6 +207,20 @@ Highlights:
 | no eviction of expired rows | 3 failed |
 | fail over on every non-200, including 400 | 1 failed |
 | `EXTRA_RESERVE_TOKENS` ignored | 1 failed |
+| stream deadline covers headers only, not the first event | 1 failed (real-socket test) |
+| usage-only chunk forwarded to a client that didn't ask | 1 failed |
+| streamed usage ignored (always charge the estimate) | 2 failed |
+| relay delays each event (buffering) | 6 failed |
+| client disconnect releases instead of charging | 4 failed |
+| mid-stream break without an error event | 1 failed |
+| tenant allowlist ignored | 1 failed |
+| router ignores the configured tokenizer | 1 failed |
+
+Two of these first **survived**. The first-event deadline mutant survived
+because the in-process transport buffers the provider's whole response, so
+a real-socket test was added. The usage-chunk mutant survived because the
+test only checked for a `usage` key, so it now also asserts that no empty
+chunk is relayed.
 | deferred `BEGIN` instead of `BEGIN IMMEDIATE` | passes. **Equivalent here:** the first statement is the eviction `DELETE`, which takes the write lock immediately. `IMMEDIATE` is kept so correctness doesn't depend on statement order. |
 
 ### Live run against a real provider (xAI)
@@ -162,14 +241,19 @@ reasoning model such as `grok-4.3` needs 2.7–5.5s before its first token,
 so with that model as primary, many longer prompts will fail over. For such
 a deployment, raise `PRIMARY_TIMEOUT_MS` in `.env`.
 
+**Live streaming run (xAI, 2026-11-09).** Three streamed requests to
+`grok-4.3` through the router, with `ROUTER_API_KEYS` set and `TOKENIZER=auto`
+(which resolved to `tiktoken:o200k_base`). Each was served by the primary,
+with the first event after 1.0–1.25s, comfortably inside the 3000ms deadline.
+Each committed Grok's real usage (319–370 tokens), and a made-up key got
+401 `authentication_error`.
+
 ## Limits / next steps
 
-- **Streaming** (`stream: true`) is rejected with 400. Failover mid-stream
-  needs a "no bytes sent yet" rule.
-- **Tenants.** Any bearer key is a tenant; authentication belongs in front
-  (e.g. the Task 2 gateway). Otherwise rotating keys would bypass limits.
-- **Estimation** is chars/4. A real tokenizer (tiktoken) would tighten the
-  reservation, but reconciliation already corrects the books after each call.
+- **Tenant keys are a static list.** Rotating them means a restart; a
+  database or the Task 2 gateway in front would allow live changes.
+- **Streaming retries.** A stream that breaks after the first byte is not
+  retried. Resuming would need provider-side support.
 - **Scale.** SQLite serializes all writers on one host. That's fine for a
   single gateway host; a multi-host deployment would move the same algorithm
   to Redis (sorted set + Lua) or Postgres.

@@ -9,6 +9,13 @@
   slow_body   sends headers immediately, then stalls `delay` before the body
   garbage     200 with a non-JSON body
 
+With `"stream": true` the same modes apply before the stream starts, plus:
+  stall_first  headers sent, then `delay` seconds before the first event
+  break        a few events, then the connection ends without [DONE]
+  slow_stream  `delay` seconds between content events
+A usage-only final chunk (choices: []) is sent when the request has
+stream_options.include_usage, as OpenAI does.
+
 `app.state.calls` counts requests received; `app.state.completed` counts
 responses fully sent (a cancelled/timed-out request never completes).
 
@@ -50,6 +57,8 @@ def create_mock_provider(name: str = "mock", mode: str = "ok") -> Starlette:
             return Response("<html>oops</html>", status_code=200)
         if st.mode == "hang":
             await asyncio.sleep(st.delay)
+        if body.get("stream"):
+            return StreamingResponse(_stream(st, body), media_type="text/event-stream")
         if st.mode == "slow_body":
             async def trickle():
                 # Headers now, then one whitespace byte every 0.5s: never
@@ -64,6 +73,27 @@ def create_mock_provider(name: str = "mock", mode: str = "ok") -> Starlette:
             return StreamingResponse(trickle(), media_type="application/json")
         st.completed += 1
         return JSONResponse(ok)
+
+    async def _stream(st, body):
+        def ev(choices: list, **extra) -> bytes:
+            return ("data: " + json.dumps({"id": f"cmpl-{name}-{st.calls}", "object": "chat.completion.chunk",
+                                           "model": body.get("model", name), "choices": choices, **extra})
+                    + "\n\n").encode()
+
+        if st.mode == "stall_first":
+            yield b": keep-alive comment, not an event\n\n"
+            await asyncio.sleep(st.delay)
+        yield ev([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}])
+        for piece in ["hello ", "from ", name]:
+            await asyncio.sleep(st.delay if st.mode == "slow_stream" else 0)
+            yield ev([{"index": 0, "delta": {"content": piece}, "finish_reason": None}])
+            if st.mode == "break":
+                return
+        yield ev([{"index": 0, "delta": {}, "finish_reason": "stop"}])
+        if (body.get("stream_options") or {}).get("include_usage"):
+            yield ev([], usage={"prompt_tokens": 10, "completion_tokens": st.usage - 10, "total_tokens": st.usage})
+        yield b"data: [DONE]\n\n"
+        st.completed += 1
 
     app = Starlette(routes=[Route("/v1/chat/completions", completions, methods=["POST"])])
     app.state.mode = mode
